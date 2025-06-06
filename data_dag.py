@@ -26,15 +26,21 @@ from typing import Dict, Any
 
 logger = LoggingMixin().log
 # Configuration for Redis and OpenSearch
-REDIS_HOST = ''
-REDIS_PORT = 6379
-REDIS_PASSWORD = ""
+REDIS_HOST = os.getenv('REDIS_HOST', '')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', '')
 MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
 
-OPENSEARCH_HOST = 'opensearch-dev'
-OPENSEARCH_PORT = 9200
-OPENSEARCH_USER = 'admin'
-OPENSEARCH_PASSWORD = 'Password'
+OPENSEARCH_HOST = os.getenv('OPENSEARCH_HOST', 'opensearch-dev')
+OPENSEARCH_PORT = int(os.getenv('OPENSEARCH_PORT', 9200))
+OPENSEARCH_USER = os.getenv('OPENSEARCH_USER', 'admin')
+OPENSEARCH_PASSWORD = os.getenv('OPENSEARCH_PASSWORD', 'Password')
+
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID', '')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY', '')
+AWS_REGION = os.getenv('AWS_REGION', 'us-east-2')
+SQS_QUEUE_URL = os.getenv('SQS_QUEUE_URL', 'https://sqs.us-east-2.amazonaws.com/0/sync_queue')
 
 default_args = {
     'owner': 'airflow',
@@ -46,14 +52,6 @@ default_args = {
     'retry_delay': timedelta(minutes=1),
 }
 
-dag = DAG(
-    'sqs_processor',
-    default_args=default_args,
-    description='Process messages from Lambda-triggered SQS events',
-    schedule_interval=None,  # This DAG is triggered by external events
-    catchup=False,
-    max_active_runs=40
-)
 
 CATEGORIES = [
     'technical_support',
@@ -174,7 +172,7 @@ def classify_tag_to_category(tag_input: str) -> str:
     logger.info(f"Parsed response to classify: {text_to_classify}")
 
     try:
-        client = OpenAI(api_key="")
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -301,18 +299,18 @@ class FlexibleDocument(BaseModel):
 os_client = OpenSearch(
     hosts=[{
         'host': OPENSEARCH_HOST,
-        'port': OPENSEARCH_PORT
+        'port': OPENSEARCH_PORT,
     }],
     http_auth=(OPENSEARCH_USER, OPENSEARCH_PASSWORD),
     use_ssl=False,
     verify_certs=False,
-    connection_class=RequestsHttpConnection
+    connection_class=RequestsHttpConnection,
 )
 
 
 def classify_document(text: str) -> str:
     try:
-        client = OpenAI(api_key="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")
+        client = OpenAI(api_key=OPENAI_API_KEY)
         # Send the content to OpenAI's model for classification
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -600,201 +598,172 @@ def process_event(**kwargs):
         logger.info(f"Unknown action: {action}")
 
 
+def _parse_keywords(raw_keywords: Any) -> str:
+    """Normalize keyword data into a comma-separated string."""
+    if isinstance(raw_keywords, str):
+        raw_keywords = raw_keywords.replace('\\"', '"')
+        try:
+            raw_keywords = json.loads(raw_keywords)
+        except Exception:
+            raw_keywords = [k.strip() for k in raw_keywords.split(',') if k.strip()]
+
+    if isinstance(raw_keywords, list):
+        raw_keywords = [k.strip() for k in raw_keywords if isinstance(k, str)]
+        return ', '.join(raw_keywords)
+
+    return str(raw_keywords) if raw_keywords else ''
+
+
+def _prepare_document(data: dict, index: str) -> FlexibleDocument:
+    """Prepare and normalize incoming document data."""
+    if index == 'ai_news':
+        data.setdefault('topic', '')
+        data.setdefault('relevant_category', '')
+    elif index == 'ai_post':
+        data.setdefault('topic', '')
+        data.setdefault('relevantCategory', '')
+    elif index == 'ai_tools':
+        data['longDescription'] = data.get('description', '')
+        if 'icon' in data:
+            data['icon'] = f"https://cdn.cloudhands.ai/{data['icon']}"
+
+    document = FlexibleDocument(**data)
+
+    if index == 'ai_tools':
+        document.keywords = _parse_keywords(data.get('keywords'))
+
+    document.category = str(classify_document(str(data)))
+    return document
+
+
+def _ensure_redis_index(client: redis.Redis, index: str, doc: FlexibleDocument) -> None:
+    """Ensure the Redis search index exists."""
+    try:
+        client.ft(index).info()
+        return
+    except ResponseError:
+        pass
+
+    schema = [
+        TextField("category"),
+        NumericField("published"),
+        VectorField(
+            "embedding",
+            "FLAT",
+            {"TYPE": "FLOAT32", "DIM": 384, "DISTANCE_METRIC": "COSINE"},
+        ),
+    ]
+
+    for key, value in doc.dict().items():
+        if extract_timestamp(value) is not None:
+            schema.append(NumericField(key))
+
+    if index == 'ai_tools':
+        schema = [
+            TextField("name"),
+            TextField("category"),
+            NumericField("published"),
+            VectorField("embedding", "FLAT", {"TYPE": "FLOAT32", "DIM": 384, "DISTANCE_METRIC": "COSINE"}),
+        ]
+    elif index == 'ai_post':
+        schema.extend([
+            TextField("postType"),
+            TextField("messageType"),
+            TagField("languages"),
+            TextField("relevantCategory"),
+        ])
+    elif index == 'ai_news':
+        schema.extend([
+            TextField("source"),
+            TextField("type"),
+            TextField("topic"),
+            TextField("relevant_category"),
+        ])
+
+    prefix = f"{index}:"
+    client.ft(index).create_index(
+        fields=schema,
+        definition=IndexDefinition(prefix=[prefix], index_type=IndexType.HASH),
+    )
+
+
+def _generate_embedding(text: str) -> tuple[np.ndarray | None, bytes | None]:
+    """Generate a vector embedding from text."""
+    if not text:
+        return None, None
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModel.from_pretrained(MODEL_NAME)
+    inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+    with torch.no_grad():
+        embedding = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy()
+
+    return embedding, np.array(embedding, dtype=np.float32).tobytes()
+
+
+
 def save_document(data):
+    """Refactored document save handler."""
     client = redis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,
         password=REDIS_PASSWORD,
-        decode_responses=False
+        decode_responses=False,
     )
 
     try:
         index = data.get("index", "default")
 
-        if index == 'ai_news':
-            data['data']['topic'] = ''
-            data['data']['relevant_category'] = ''
-
-        if index == 'ai_post':
-            data['data']['topic'] = ''
-            data['data']['relevantCategory'] = ''
-
-        if index == 'ai_tools':
-            data['data']['longDescription'] = data['data']['description']
-            data['data']['icon'] = f'https://cdn.cloudhands.ai/{data['data']['icon']}'
-
-        if index == 'ai_tags':
+        if index == "ai_tags":
             save_tags_to_postgres(data, index)
             return
 
-        document_data = FlexibleDocument(**data['data'])
-
-        # Redis index and key setup
-        index = data.get("index", "default")
+        document_data = _prepare_document(data["data"], index)
         key = f"{index}:{document_data.id}"
-        document_category = str(classify_document(str(data)))
-        # Add category to the document data
-        document_data.category = document_category
 
-        if index == "ai_tools":
-            keywords = data['data']['keywords']
+        _ensure_redis_index(client, index, document_data)
 
-            if isinstance(keywords, str):
-                keywords = keywords.replace('\\"', '"')
-                try:
-                    keywords = json.loads(keywords)
-                except Exception:
-                    keywords = [k.strip() for k in keywords.split(",") if k.strip()]
-
-            if isinstance(keywords, list):
-                keywords = [k.strip() for k in keywords if isinstance(k, str)]
-
-            keywords_str = ", ".join(keywords) if keywords else "" 
-            document_data.keywords = keywords_str
-
-        # Ensure that the Redis index exists or create it
-        try:
-            client.ft(index).info()
-            logger.info(f"Index '{index}' already exists.")
-        except ResponseError:
-            schema_needed = [
-                    TextField("category"),
-                    NumericField("published"),
-                    VectorField("embedding", "FLAT", {"TYPE": "FLOAT32", "DIM": 384, "DISTANCE_METRIC": "COSINE"}),
-                ]
-
-            for key, value in document_data.dict().items():
-                timestamp = extract_timestamp(value)
-                if timestamp is not None:
-                    schema_needed.append(NumericField(key))
-
-            if index == "ai_tools":
-                schema_needed = [
-                    TextField("name"),
-                    TextField("category"),
-                    NumericField("published"),
-                    VectorField("embedding", "FLAT", {"TYPE": "FLOAT32", "DIM": 384, "DISTANCE_METRIC": "COSINE"}),
-                ]
-
-            if index == "ai_post":
-
-                classification_ids = classify_tag_to_category(document_data)
-                logger.info(f"Classification IDs: {classification_ids}")
-
-                document_data.relevantCategory = ",".join(map(str, classification_ids)) if classification_ids else ""
-
-                schema_needed.extend([
-                    TextField("postType"),
-                    TextField("messageType"),
-                    TagField("languages"),
-                    TextField("relevantCategory")
-                ])
-
-            elif index == "ai_news":
-                classification_ids = classify_tag_to_category(document_data)
-                logger.info(f"Classification IDs: {classification_ids}")
-
-                document_data.relevant_category = ",".join(map(str, classification_ids)) if classification_ids else ""
-
-                schema_needed.extend([
-                    TextField("source"),
-                    TextField("type"),
-                    TextField("topic"),
-                    TextField("relevant_category")
-                ])
-
-            logger.info(f"Index '{index}' does not exist. Creating new index.")
-            SCHEMA = schema_needed
-            prefix = f'{index}:'
-            client.ft(index).create_index(
-                fields=SCHEMA, 
-                definition=IndexDefinition(prefix=[prefix], index_type=IndexType.HASH)
-            )
-            logger.info(f"Index '{index}' created with prefix '{prefix}'.")
-
-        logger.info(f"Document data after timestamp conversion: {document_data}")
-
-        # Determine text fields for embedding generation based on index type
         if index == "ai_news":
-            document_data.relevant_category = classify_tag_to_category(document_data)
-            fields_to_tokenize = [document_data.title, document_data.summary]
-            if 'id' in data['data']:
-                document_data.id = data['data']['id']
+            fields = [document_data.title, document_data.summary]
         elif index == "ai_post":
-            classification_result = classify_tag_to_category(document_data)
-            document_data.relevantCategory = classification_result
-            if 'id' in data['data']:
-                document_data.id = data['data']['id']
-            fields_to_tokenize = [document_data.message] if document_data.message else "no content"
+            fields = [document_data.message or "no content"]
         elif index == "ai_tools":
-            fields_to_tokenize = [
-                document_data.name,
-                document_data.longDescription
-            ]
+            fields = [document_data.name, document_data.longDescription]
         else:
-            fields_to_tokenize = []
+            fields = []
 
-        # Join fields for tokenization and generate embedding
-        combined_text = " ".join(filter(None, fields_to_tokenize))
-        embedding_bytes = None
+        combined_text = " ".join(filter(None, fields))
+        embedding, embedding_bytes = _generate_embedding(combined_text)
 
-        if combined_text:
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-            model = AutoModel.from_pretrained(MODEL_NAME)
-
-            inputs = tokenizer(combined_text, return_tensors='pt', truncation=True, max_length=512)
-
-            with torch.no_grad():
-                embedding = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy()
-
-            embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
-        else:
-            logger.info(f"No valid text found for tokenization for document ID {document_data.id}")
-
-        # Prepare the document for Redis, focusing only on the 'data' content
         document = document_data.model_dump(by_alias=True)
-
-        if index != 'ai_tools':
-            del document['pricingModel']
-        # Add embedding bytes to document if available
+        if index != "ai_tools":
+            document.pop("pricingModel", None)
         if embedding_bytes:
             document["embedding"] = embedding_bytes
 
-        # Serialize complex data types
         for k, v in document.items():
             timestamp = extract_timestamp(v)
             if timestamp is not None:
                 document[k] = timestamp
             if isinstance(v, (dict, list)):
-                document[k] = json.dumps(v)  # Convert lists/dicts to JSON strings
+                document[k] = json.dumps(v)
             elif v is None:
                 document[k] = ""
             elif isinstance(v, bool):
                 document[k] = int(v)
 
-        # Save the document to Redis
-        logger.info(f"Final Document for Redis {document}")
-        try:
-            client.hset(name=key, mapping=document)
-        except Exception as e:
-            logger.error(f"Error saving to Redis: {e}")
+        client.hset(name=key, mapping=document)
         client.sadd(f"{index}:_keys", key)
-
         logger.info(f"Document with ID {document_data.id} saved in Redis under index '{index}'.")
 
-        # Save to Postgres for specific indexes (news, posts, products)
         if index in ['ai_news', 'ai_post', 'ai_tools']:
             save_to_postgres(document, index)
-        
         if index in ['ai_post', 'ai_news']:
             send_to_sqs(document, index)
-
-        # Save to OpenSearch if embedding was created
         if embedding is not None:
             opensearch_doc = document.copy()
             opensearch_doc['embedding'] = embedding.tolist()
             save_to_opensearch(opensearch_doc, index)
-
     except Exception as e:
         logger.info(f"Error processing document ID {data['data'].get('id')}: {e}")
         logger.info(traceback.format_exc())
@@ -904,12 +873,12 @@ def send_to_sqs(document: Dict[str, Any], index: str) -> None:
         # Initialize SQS client
         sqs = boto3.client(
             'sqs',
-            region_name='us-east-2',  # Update with your region
-            aws_access_key_id='',  # Replace with your credentials
-            aws_secret_access_key=''
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY
         )
 
-        queue_url = 'https://sqs.us-east-2.amazonaws.com/0/sync_queue'
+        queue_url = SQS_QUEUE_URL
 
         del document['embedding']
 
@@ -942,7 +911,7 @@ def send_to_sqs(document: Dict[str, Any], index: str) -> None:
         else:
             relevant_category_arr = []
 
-        logger.info(f" Message id {document.get("id")}")
+        logger.info(f" Message id {document.get('id')}")
         message = {
             "id": document.get("id"),
             "tags": relevant_category_arr,
@@ -1160,9 +1129,21 @@ def update_news_tags(news_id: int, tag_ids: list[int]):
             conn.close()
 
 
-process_task = PythonOperator(
-    task_id='process_event',
-    provide_context=True,
-    python_callable=process_event,
-    dag=dag
-)
+def create_dag() -> DAG:
+    with DAG(
+        dag_id='sqs_processor',
+        default_args=default_args,
+        description='Process messages from Lambda-triggered SQS events',
+        schedule_interval=None,
+        catchup=False,
+        max_active_runs=40,
+    ) as dag:
+        PythonOperator(
+            task_id='process_event',
+            provide_context=True,
+            python_callable=process_event,
+        )
+    return dag
+
+
+dag = create_dag()
